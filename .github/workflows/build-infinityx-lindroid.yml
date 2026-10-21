@@ -1,0 +1,427 @@
+name: Build Lindroid from Infinity-X Source
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_branch:
+        description: 'Project Infinity-X ROM branch'
+        required: true
+        default: '17'
+      target_product:
+        description: 'Lunch target product'
+        required: true
+        default: 'aosp_arm64-userdebug'
+      build_targets:
+        description: 'Soong build targets'
+        required: true
+        default: 'vendor.lindroid.composer-ndk perspectived liblxc lxc_start lxc_stop lxc_attach lxc_info lxc_ls LindroidUI'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-infinityx-lindroid.yml'
+      - 'service.sh'
+      - 'sepolicy.rule'
+      - 'module.prop'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Compile Lindroid & Package Magisk Module
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Lindroid Module Repository
+        uses: actions/checkout@v4
+        with:
+          path: module_repo
+
+      - name: Free Disk Space & Setup 16GB Swap
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/share/swift /opt/hostedtoolcache || true
+          sudo apt-get clean || true
+          docker rmi $(docker images -q) 2>/dev/null || true
+          echo "=== Disk space after cleanup ==="
+          df -h
+
+          echo "Setting up 16GB swap file..."
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install Build Dependencies & Repo Tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git-core git-lfs gnupg flex bison build-essential zip curl zlib1g-dev \
+            libc6-dev libncurses-dev x11proto-core-dev libx11-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            libssl-dev bc rsync ccache python3 python-is-python3 libelf-dev \
+            device-tree-compiler openssh-client libarchive-tools openjdk-21-jdk || true
+
+          git lfs install || true
+
+          # Install Google repo tool
+          mkdir -p ~/.bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+x ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+
+          # Git configuration required by repo
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global color.ui false
+
+      - name: Initialize Project Infinity-X Manifest
+        run: |
+          mkdir -p ~/android
+          cd ~/android
+          ~/.bin/repo init \
+            --depth=1 \
+            --no-repo-verify \
+            -u https://github.com/ProjectInfinity-X/manifest \
+            -b "${{ github.event.inputs.rom_branch || '17' }}" \
+            -g default,-mips,-darwin,-notdefault
+
+      - name: Selective Repo Sync (Core Build & Frameworks)
+        run: |
+          cd ~/android
+          echo "Syncing required core AOSP repositories (~8-10 GB)..."
+          ~/.bin/repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune --force-sync -j$(nproc) \
+            build/make \
+            build/soong \
+            build/blueprint \
+            build/release \
+            bionic \
+            system/core \
+            system/logging \
+            system/libbase \
+            system/libprocinfo \
+            system/tools/aidl \
+            system/tools/hidl \
+            system/tools/sysprop \
+            system/tools/xsdc \
+            frameworks/native \
+            frameworks/base \
+            hardware/interfaces \
+            hardware/libhardware \
+            hardware/libhardware_legacy \
+            prebuilts/build-tools \
+            prebuilts/clang/host/linux-x86 \
+            prebuilts/sdk \
+            prebuilts/go/linux-x86 \
+            prebuilts/bazel/common \
+            prebuilts/jdk/jdk21 \
+            prebuilts/misc \
+            prebuilts/siso \
+            external/golang-protobuf \
+            external/go-cmp \
+            external/starlark-go \
+            external/pogreb \
+            external/libcxx \
+            external/protobuf \
+            external/kotlinc \
+            external/kotlinx.coroutines \
+            toolchain/pgo-profiles || true
+
+      - name: Clone Lindroid Submodules
+        run: |
+          cd ~/android
+          echo "Cloning vendor_lindroid..."
+          git clone --depth=1 https://github.com/Linux-on-droid/vendor_lindroid.git -b lindroid-22.1 vendor/lindroid
+
+          echo "Cloning external_lxc..."
+          git clone --depth=1 https://github.com/Linux-on-droid/external_lxc.git -b lindroid-21 external/lxc
+
+      - name: Apply Frameworks Patches (EventHub / inputflinger)
+        run: |
+          cd ~/android
+          if [ -d "frameworks/native" ]; then
+            echo "Applying EventHub IDC disable patch (Gerrit 12936)..."
+            cd frameworks/native
+            curl -s "https://gerrit.libremobileos.com/changes/12936/revisions/current/patch" | base64 -d | git apply --whitespace=nowarn || {
+              echo "Patch apply skipped or already present."
+            }
+            cd ../..
+          fi
+
+      - name: Compile Lindroid Modules
+        run: |
+          cd ~/android
+
+          # Satisfy vendor/infinity references in build/envsetup.sh without pulling in full ROM repo
+          mkdir -p vendor/infinity/build
+          touch vendor/infinity/build/envsetup.sh
+          sed -i '/vendor\/infinity\/build\/envsetup.sh/d' build/make/envsetup.sh 2>/dev/null || true
+          sed -i '/vendor\/infinity\/build\/envsetup.sh/d' build/envsetup.sh 2>/dev/null || true
+
+          source build/envsetup.sh
+
+          # Allow partial tree compilation without requiring full 100GB AOSP dependencies
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export SOONG_ALLOW_MISSING_DEPENDENCIES=true
+          export BUILD_BROKEN_MISSING_OUTPUTS=true
+
+          # Satisfy board_config.mk VNDK snapshot check without downloading multi-GB obsolete prebuilts
+          for v in 28 29 30 31 32 33 34 35; do
+            mkdir -p prebuilts/vndk/v$v/arm64
+            touch prebuilts/vndk/v$v/arm64/Android.bp
+          done
+
+          # Satisfy soong_config.mk AFDO profile include
+          mkdir -p toolchain/pgo-profiles/sampling
+          touch toolchain/pgo-profiles/sampling/afdo_profiles.mk
+
+          # Remove unused VINTF compatibility matrix build rules that require unneeded kernel-config/SELinux plugins
+          rm -rf hardware/interfaces/compatibility_matrices
+
+          # Prune unused HALs from hardware/interfaces to prevent unneeded HIDL/XSD parsing
+          find hardware/interfaces -maxdepth 1 -mindepth 1 -not -name "graphics" -not -name "common" -not -name "Android.bp" -not -name "NOTICE" -exec rm -rf {} +
+          find hardware/interfaces/graphics -maxdepth 1 -mindepth 1 -not -name "common" -not -name "Android.bp" -exec rm -rf {} +
+
+          # Prune unneeded tests from frameworks that require missing CTS/test suite plugins (e.g. csuite_test)
+          find frameworks/base frameworks/native -type d -name "tests" -exec rm -rf {} +
+          find frameworks/base frameworks/native -type d -name "test" -not -path "*/include/*" -exec rm -rf {} +
+
+          # Simplify graphics/Android.bp to provide graphics.common V7 defaults
+          printf '%s\n' \
+            'package {' \
+            '    default_applicable_licenses: ["hardware_interfaces_license"],' \
+            '}' \
+            '' \
+            'aidl_interface_defaults {' \
+            '    name: "android.hardware.graphics.common-latest",' \
+            '    imports: [' \
+            '        "android.hardware.graphics.common-V7",' \
+            '    ],' \
+            '}' \
+            '' \
+            'cc_defaults {' \
+            '    name: "android.hardware.graphics.common-ndk_static",' \
+            '    target: {' \
+            '        linux: {' \
+            '            static_libs: [' \
+            '                "android.hardware.graphics.common-V7-ndk",' \
+            '            ],' \
+            '        },' \
+            '    },' \
+            '    static_libs: [' \
+            '        "android.hardware.graphics.common-V7-ndk",' \
+            '    ],' \
+            '}' \
+            '' \
+            'cc_defaults {' \
+            '    name: "android.hardware.graphics.common-ndk_shared",' \
+            '    target: {' \
+            '        linux: {' \
+            '            shared_libs: [' \
+            '                "android.hardware.graphics.common-V7-ndk",' \
+            '            ],' \
+            '        },' \
+            '    },' \
+            '    shared_libs: [' \
+            '        "android.hardware.graphics.common-V7-ndk",' \
+            '    ],' \
+            '}' > hardware/interfaces/graphics/Android.bp
+
+          # Remove unused hidl_package_root in vendor/lindroid/interfaces/Android.bp (Lindroid uses AIDL)
+          if [ -f vendor/lindroid/interfaces/Android.bp ]; then
+            sed -i '/hidl_package_root/,+3d' vendor/lindroid/interfaces/Android.bp || true
+          fi
+
+          # Ensure Siso binary has execute permissions
+          chmod +x prebuilts/siso/linux-x86/siso 2>/dev/null || true
+
+          TARGET="${{ github.event.inputs.target_product || 'aosp_arm64-userdebug' }}"
+          echo "Lunching target: $TARGET"
+          lunch "$TARGET" || lunch aosp_arm64-trunk_staging-userdebug || lunch lineage_arm64-userdebug || lunch generic_arm64-userdebug
+
+          echo "=== Compiling native composer and LXC binaries ==="
+          m -j$(nproc) vendor.lindroid.composer-ndk perspectived liblxc lxc_start lxc_stop lxc_attach lxc_info lxc_ls
+
+          echo "=== Compiling LindroidUI and JNI library ==="
+          m -j$(nproc) LindroidUI libjni_lindroidui || echo "Soong LindroidUI compilation completed with warnings; checking output..."
+
+      - name: Assemble Magisk / KernelSU Module
+        run: |
+          MOD_DIR="$GITHUB_WORKSPACE/assembled_module"
+          mkdir -p "$MOD_DIR/system_ext/app/LindroidUI"
+          mkdir -p "$MOD_DIR/system_ext/lib64"
+          mkdir -p "$MOD_DIR/system_ext/bin"
+          mkdir -p "$MOD_DIR/system_ext/usr/share/lindroid/lxc"
+          mkdir -p "$MOD_DIR/system/usr/idc"
+
+          echo "=== Copying baseline module files ==="
+          cp module_repo/module.prop "$MOD_DIR/"
+          cp module_repo/service.sh "$MOD_DIR/"
+          cp module_repo/sepolicy.rule "$MOD_DIR/"
+          chmod +x "$MOD_DIR/service.sh"
+
+          echo "=== Copying compiled outputs from ~/android/out ==="
+          # LindroidUI APK
+          find ~/android/out/ -name "LindroidUI*.apk" -not -path "*/host/*" -not -path "*tmp*" -exec cp -v {} "$MOD_DIR/system_ext/app/LindroidUI/LindroidUI.apk" \; || true
+
+          # Shared libraries (target arm64 only)
+          find ~/android/out/ -name "vendor.lindroid.composer-ndk.so" -not -path "*/host/*" -not -path "*linux_glibc*" -exec cp -v {} "$MOD_DIR/system_ext/lib64/" \; || true
+          find ~/android/out/ -name "libjni_lindroidui.so" -not -path "*/host/*" -not -path "*linux_glibc*" -exec cp -v {} "$MOD_DIR/system_ext/lib64/" \; || true
+          find ~/android/out/ -name "liblxc.so" -not -path "*/host/*" -not -path "*linux_glibc*" -exec cp -v {} "$MOD_DIR/system_ext/lib64/" \; || true
+          find ~/android/out/ -name "vendor.lindroid.perspective*.so" -not -path "*/host/*" -not -path "*linux_glibc*" -exec cp -v {} "$MOD_DIR/system_ext/lib64/" \; || true
+
+          # Perspectived and LXC binaries
+          find ~/android/out/ -name "perspectived" -type f -perm /111 -not -path "*/host/*" -not -path "*linux_glibc*" -exec cp -v {} "$MOD_DIR/system_ext/bin/" \; || true
+          find ~/android/out/ -name "lxc_*" -type f -perm /111 -not -path "*/host/*" -not -path "*linux_glibc*" -exec cp -v {} "$MOD_DIR/system_ext/bin/" \; || true
+
+          # Compile LindroidUI via Gradle wrapper if not produced by Soong
+          if [ ! -f "$MOD_DIR/system_ext/app/LindroidUI/LindroidUI.apk" ] && [ -d ~/android/vendor/lindroid/app ]; then
+            echo "LindroidUI APK not found in out/, attempting Gradle fallback build..."
+            cd ~/android/vendor/lindroid/app
+
+            # Set up Android SDK path
+            if [ -d "/usr/local/lib/android/sdk" ]; then
+              export ANDROID_HOME="/usr/local/lib/android/sdk"
+              echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
+            fi
+
+            # Generate keystore and properties required by app/build.gradle.kts
+            if [ ! -f keystore.properties ]; then
+              keytool -genkey -v -keystore debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US" || true
+              printf "keyAlias=androiddebugkey\nkeyPassword=android\nstoreFile=debug.keystore\nstorePassword=android\n" > keystore.properties
+            fi
+
+            # Supply framework stubs for compileOnly
+            mkdir -p app/system_libs
+            if [ -f ~/android/out/soong/.intermediates/frameworks/base/framework/android_common/turbine-combined/framework.jar ]; then
+              cp -v ~/android/out/soong/.intermediates/frameworks/base/framework/android_common/turbine-combined/framework.jar app/system_libs/framework.jar
+            elif [ -f ~/android/prebuilts/sdk/current/public/android.jar ]; then
+              cp -v ~/android/prebuilts/sdk/current/public/android.jar app/system_libs/framework.jar
+            fi
+
+            chmod +x gradlew || true
+            ./gradlew assembleDebug || ./gradlew assembleRelease || true
+            find . -name "*.apk" -not -path "*/build/outputs/apk/androidTest/*" -exec cp -v {} "$MOD_DIR/system_ext/app/LindroidUI/LindroidUI.apk" \; || true
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          # Lindroid configurations, templates and helper libc
+          if [ -d ~/android/vendor/lindroid ]; then
+            cp -v ~/android/vendor/lindroid/configs/disabled.idc "$MOD_DIR/system/usr/idc/Vendor_000a_Product_000a.idc" 2>/dev/null || true
+            cp -v ~/android/vendor/lindroid/configs/disabled.idc "$MOD_DIR/system/usr/idc/Vendor_000a_Product_000b.idc" 2>/dev/null || true
+            cp -v ~/android/vendor/lindroid/configs/disabled.idc "$MOD_DIR/system/usr/idc/Vendor_000a_Product_000c.idc" 2>/dev/null || true
+            cp -v ~/android/vendor/lindroid/configs/disabled.idc "$MOD_DIR/system/usr/idc/Vendor_000a_Product_000d.idc" 2>/dev/null || true
+            cp -v ~/android/vendor/lindroid/configs/disabled.idc "$MOD_DIR/system/usr/idc/disabled.idc" 2>/dev/null || true
+            cp -v ~/android/vendor/lindroid/lxc/template.sh "$MOD_DIR/system_ext/bin/lxc-lindroid" 2>/dev/null || true
+            chmod +x "$MOD_DIR/system_ext/bin/lxc-lindroid" 2>/dev/null || true
+            cp -v ~/android/vendor/lindroid/lxc/default.conf "$MOD_DIR/system_ext/usr/share/lindroid/lxc/lindroid-default.conf" 2>/dev/null || true
+            cp -v ~/android/vendor/lindroid/prebuilt/arm64/libc.so "$MOD_DIR/system_ext/usr/share/lindroid/libc.so" 2>/dev/null || true
+          fi
+
+          # Ensure all binaries in bin are executable
+          chmod +x "$MOD_DIR/system_ext/bin/"* 2>/dev/null || true
+
+          echo "=== Assembled Module Directory Tree ==="
+          ls -lR "$MOD_DIR"
+
+          echo "=== Validating Required Lindroid Binaries ==="
+          CRITICAL_ERRORS=0
+
+          if [ ! -f "$MOD_DIR/system_ext/app/LindroidUI/LindroidUI.apk" ]; then
+            echo "::error::LindroidUI.apk is missing!"
+            CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+          else
+            echo "OK: Found LindroidUI.apk ($(du -h "$MOD_DIR/system_ext/app/LindroidUI/LindroidUI.apk" | cut -f1))"
+          fi
+
+          if [ ! -f "$MOD_DIR/system_ext/lib64/vendor.lindroid.composer-ndk.so" ]; then
+            echo "::error::vendor.lindroid.composer-ndk.so is missing!"
+            CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+          else
+            echo "OK: Found vendor.lindroid.composer-ndk.so ($(du -h "$MOD_DIR/system_ext/lib64/vendor.lindroid.composer-ndk.so" | cut -f1))"
+          fi
+
+          if [ ! -f "$MOD_DIR/system_ext/bin/perspectived" ]; then
+            echo "::error::perspectived binary is missing!"
+            CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+          else
+            echo "OK: Found perspectived ($(du -h "$MOD_DIR/system_ext/bin/perspectived" | cut -f1))"
+          fi
+
+          if [ ! -f "$MOD_DIR/system_ext/lib64/liblxc.so" ]; then
+            echo "::error::liblxc.so is missing!"
+            CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+          else
+            echo "OK: Found liblxc.so ($(du -h "$MOD_DIR/system_ext/lib64/liblxc.so" | cut -f1))"
+          fi
+
+          if [ ! -f "$MOD_DIR/system_ext/bin/lxc_start" ]; then
+            echo "::error::lxc_start binary is missing!"
+            CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+          else
+            echo "OK: Found lxc_start ($(du -h "$MOD_DIR/system_ext/bin/lxc_start" | cut -f1))"
+          fi
+
+          if [ "$CRITICAL_ERRORS" -gt 0 ]; then
+            echo "FATAL: Module assembly failed! $CRITICAL_ERRORS critical Lindroid component(s) were not built."
+            exit 1
+          fi
+
+      - name: Package Magisk / KernelSU Zip
+        run: |
+          MOD_DIR="$GITHUB_WORKSPACE/assembled_module"
+          PACKAGE_NAME="lindroid-infinityx-17-$(date +'%Y%m%d')-${GITHUB_SHA::7}.zip"
+          echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
+          cd "$MOD_DIR"
+          zip -r9 "$GITHUB_WORKSPACE/${PACKAGE_NAME}" *
+          cd "$GITHUB_WORKSPACE"
+          cp "${PACKAGE_NAME}" "lindroid-infinityx-latest.zip"
+          echo "Package created successfully:"
+          unzip -l "${PACKAGE_NAME}"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            ${{ env.PACKAGE_NAME }}
+            lindroid-infinityx-latest.zip
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="v2.1.${{ github.run_number }}"
+          RELEASE_TITLE="Lindroid Infinity-X Module ${TAG_NAME}"
+          NOTES="### Lindroid Magisk/KernelSU Module compiled for Project Infinity-X (Android 17)
+          
+          **Components Included:**
+          - LindroidUI App (\`system_ext/app/LindroidUI/LindroidUI.apk\`)
+          - vendor.lindroid.composer-ndk AIDL HAL (\`system_ext/lib64/vendor.lindroid.composer-ndk.so\`)
+          - libjni_lindroidui JNI library (\`system_ext/lib64/libjni_lindroidui.so\`)
+          - perspectived container management daemon (\`system_ext/bin/perspectived\`)
+          - liblxc and LXC binaries (\`liblxc.so\`, \`lxc_start\`, \`lxc_stop\`, \`lxc_attach\`, etc.)
+          - IDC input filter profiles for desktop convergence
+          
+          **Build Information:**
+          - ROM Source: Project Infinity-X (Branch: ${{ github.event.inputs.rom_branch || '17' }})
+          - Commit: \`${GITHUB_SHA::7}\`
+          - Run: \`${{ github.run_number }}\`"
+
+          if gh release view "${TAG_NAME}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${PACKAGE_NAME}" "lindroid-infinityx-latest.zip" --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "${TAG_NAME}" \
+              "${PACKAGE_NAME}" \
+              "lindroid-infinityx-latest.zip" \
+              --repo "${{ github.repository }}" \
+              --title "${RELEASE_TITLE}" \
+              --notes "${NOTES}" \
+              --latest
+          fi

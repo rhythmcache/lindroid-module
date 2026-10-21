@@ -1,0 +1,6 @@
+# Allow untrusted app and platform apps to communicate with composer and binderfs
+allow untrusted_app binderfs dir { read write open add_name search }
+allow untrusted_app binderfs file { read write open getattr ioctl }
+allow untrusted_app default_android_hwservice hwservice_manager { add find }
+allow system_server default_android_hwservice hwservice_manager { find }
+allow system_app default_android_hwservice hwservice_manager { find }

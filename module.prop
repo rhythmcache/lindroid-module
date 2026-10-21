@@ -1,0 +1,6 @@
+id=lindroid_module
+name=Lindroid Module
+version=v2.1
+versionCode=21
+author=Linux-on-droid & rhythmcache
+description=Lindroid AppHWC, Composer, and UI components packaged as a Magisk/KernelSU module.
