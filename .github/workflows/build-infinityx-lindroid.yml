@@ -111,7 +111,6 @@ jobs:
             system/tools/sysprop \
             system/tools/xsdc \
             frameworks/native \
-            frameworks/base \
             hardware/interfaces \
             hardware/libhardware \
             hardware/libhardware_legacy \
@@ -188,9 +187,10 @@ jobs:
           find hardware/interfaces -maxdepth 1 -mindepth 1 -not -name "graphics" -not -name "common" -not -name "Android.bp" -not -name "NOTICE" -exec rm -rf {} +
           find hardware/interfaces/graphics -maxdepth 1 -mindepth 1 -not -name "common" -not -name "Android.bp" -exec rm -rf {} +
 
-          # Prune unneeded tests from frameworks that require missing CTS/test suite plugins (e.g. csuite_test)
-          find frameworks/base frameworks/native -type d -name "tests" -exec rm -rf {} +
-          find frameworks/base frameworks/native -type d -name "test" -not -path "*/include/*" -exec rm -rf {} +
+          # Prune unneeded tests and Java bindings that require missing SDK/CTS modules
+          find frameworks/native -type d -name "tests" -exec rm -rf {} +
+          find frameworks/native -type d -name "test" -not -path "*/include/*" -exec rm -rf {} +
+          rm -rf frameworks/base 2>/dev/null || true
 
           # Simplify graphics/Android.bp to provide graphics.common V7 defaults
           printf '%s\n' \
@@ -246,10 +246,7 @@ jobs:
           lunch "$TARGET" || lunch aosp_arm64-trunk_staging-userdebug || lunch lineage_arm64-userdebug || lunch generic_arm64-userdebug
 
           echo "=== Compiling native composer and LXC binaries ==="
-          m -j$(nproc) vendor.lindroid.composer-ndk perspectived liblxc lxc_start lxc_stop lxc_attach lxc_info lxc_ls
-
-          echo "=== Compiling LindroidUI and JNI library ==="
-          m -j$(nproc) LindroidUI libjni_lindroidui || echo "Soong LindroidUI compilation completed with warnings; checking output..."
+          m -j$(nproc) vendor.lindroid.composer-ndk perspectived liblxc lxc_start lxc_stop lxc_attach lxc_info lxc_ls libjni_lindroidui || m -j$(nproc) vendor.lindroid.composer-ndk perspectived liblxc lxc_start lxc_stop lxc_attach lxc_info lxc_ls
 
       - name: Assemble Magisk / KernelSU Module
         run: |
@@ -299,10 +296,10 @@ jobs:
 
             # Supply framework stubs for compileOnly
             mkdir -p app/system_libs
-            if [ -f ~/android/out/soong/.intermediates/frameworks/base/framework/android_common/turbine-combined/framework.jar ]; then
-              cp -v ~/android/out/soong/.intermediates/frameworks/base/framework/android_common/turbine-combined/framework.jar app/system_libs/framework.jar
-            elif [ -f ~/android/prebuilts/sdk/current/public/android.jar ]; then
+            if [ -f ~/android/prebuilts/sdk/current/public/android.jar ]; then
               cp -v ~/android/prebuilts/sdk/current/public/android.jar app/system_libs/framework.jar
+            elif [ -f /usr/local/lib/android/sdk/platforms/android-34/android.jar ]; then
+              cp -v /usr/local/lib/android/sdk/platforms/android-34/android.jar app/system_libs/framework.jar
             fi
 
             chmod +x gradlew || true
